@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "AI-powered trading bot using Claude and Alpaca"
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py>=0.28.0",
+    "anthropic>=0.40.0",
+    "ta>=0.11.0",
+    "pandas>=2.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "pytz>=2024.1",
+]
+
+[project.scripts]
+trading-bot = "trading_bot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
