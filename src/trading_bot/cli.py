@@ -11,6 +11,7 @@ from trading_bot.market_data import (
     fetch_minute_bars,
     fetch_intraday_bars,
     fetch_latest_price,
+    fetch_option_price,
     fetch_account,
     fetch_positions,
     fetch_trade_history,
@@ -43,6 +44,8 @@ from trading_bot.display import (
     show_trade_history,
     show_account,
     show_position_review,
+    show_backtest_summary,
+    show_backtest_trades,
 )
 from rich.rule import Rule
 
@@ -539,6 +542,102 @@ def _get_underlying(symbol: str) -> str:
     return symbol
 
 
+@cli.command("backtest")
+@click.argument("symbol")
+@click.option("--days", type=int, default=365,
+              help="Days of daily bar history to use (default 365).")
+@click.option("--capital", type=float, default=10_000.0,
+              help="Starting paper capital in USD (default $10,000).")
+@click.option("--position-pct", type=float, default=0.10,
+              help="Fraction of equity per trade (default 0.10 = 10%).")
+@click.option("--stop-mult", type=float, default=1.5,
+              help="ATR multiplier for stop distance (default 1.5).")
+@click.option("--rr", type=float, default=1.5,
+              help="Risk/reward target ratio (default 1.5 → 2.25× ATR profit).")
+@click.option("--short/--no-short", default=False,
+              help="Also trade bearish SELL signals (default off).")
+@click.option("--trades/--no-trades", "show_trades", default=True,
+              help="Print individual trade list (default on).")
+@click.option("--verbose", is_flag=True, default=False,
+              help="Show entry signals beneath each trade row.")
+def backtest(
+    symbol: str,
+    days: int,
+    capital: float,
+    position_pct: float,
+    stop_mult: float,
+    rr: float,
+    short: bool,
+    show_trades: bool,
+    verbose: bool,
+):
+    """Simulate the swing strategy against historical daily bar data.
+
+    No live data or Claude calls needed — runs entirely offline against
+    Alpaca historical bars. Uses the same indicator rules as the system prompt:
+    trend, RSI, MACD, Bollinger Bands, volume confirmation.
+
+    \b
+    Exit rules:
+      • Stop loss  : entry − (stop_mult × ATR)
+      • Take profit: entry + (stop_mult × rr × ATR)
+      • EOD close  : open position closed at last bar's price
+
+    \b
+    Examples:
+      trading-bot backtest AAPL
+      trading-bot backtest AAPL --days 730 --capital 25000 --position-pct 0.05
+      trading-bot backtest SPY --days 365 --rr 2.0 --short
+    """
+    from trading_bot.backtester import run_backtest
+
+    symbol = symbol.upper()
+    config = load_config()
+
+    log_step(f"Fetching {days} days of daily bars for {symbol}...")
+    try:
+        df = fetch_bars(config, symbol, days=days)
+    except Exception as e:
+        console.print(f"[red]Failed to fetch data: {e}[/red]")
+        return
+
+    if len(df) < 65:
+        console.print(
+            f"[red]Only {len(df)} bars returned — need at least 65. "
+            "Try fewer --days or check the symbol.[/red]"
+        )
+        return
+
+    console.print(
+        f"\n[bold]Backtest[/bold]  [cyan]{symbol}[/cyan]  "
+        f"{len(df)} bars  ${capital:,.0f} start  "
+        f"{position_pct:.0%}/trade  "
+        f"SL {stop_mult}×ATR  TP {rr}:1 RR"
+        + ("  [dim]shorts enabled[/dim]" if short else "")
+    )
+    console.print(
+        "[dim]Signal: Bullish trend + RSI<70 + MACD + volume above avg (3+ conditions)[/dim]\n"
+    )
+
+    log_step("Running simulation...")
+    result = run_backtest(
+        df=df,
+        symbol=symbol,
+        capital=capital,
+        position_pct=position_pct,
+        stop_atr_mult=stop_mult,
+        rr_ratio=rr,
+        allow_short=short,
+    )
+
+    console.print()
+    show_backtest_summary(result["summary"], symbol=symbol, days=days, capital=capital)
+
+    if show_trades and result["trades"]:
+        console.print()
+        show_backtest_trades(result["trades"], verbose=verbose)
+
+
 @cli.command("review")
 @click.option("--paper/--live", default=True, help="Use paper or live trading mode.")
 @click.option("--days", type=int, default=60,
@@ -638,6 +737,7 @@ class _ManagedOption:
     """Tracks per-position state for options-swing multi-position management."""
     option_symbol: str
     contracts: int
+    entry_value: float = 0.0   # market value at time of purchase (for hard stop)
     peak_value: float = 0.0
     trailing_active: bool = False
     next_ask_threshold: float = 1.0  # start prompting at +100%
@@ -648,7 +748,10 @@ class _ManagedOption:
 @click.argument("symbol")
 @click.option("--paper/--live", default=True, help="Use paper or live trading mode.")
 @click.option("--contracts", type=int, default=1,
-              help="Number of contracts per entry (default 1, each = 100 shares).")
+              help="Contracts per entry when --risk is not set (default 1).")
+@click.option("--risk", type=float, default=None,
+              help="Position size as fraction of buying power per entry "
+                   "(e.g. 0.05 = 5%). Overrides --contracts.")
 @click.option("--auto", is_flag=True, default=False,
               help="Skip buy confirmation prompt.")
 @click.option("--interval", type=int, default=60,
@@ -661,6 +764,7 @@ def options_swing(
     symbol: str,
     paper: bool,
     contracts: int,
+    risk: float | None,
     auto: bool,
     interval: int,
     refresh: int,
@@ -672,6 +776,7 @@ def options_swing(
     Strategy rules:
       • Continuously scans for bullish setups (every --refresh seconds)
       • Selects CALL option: 15% OTM, 45–79 DTE (prefers 45–60)
+      • Hard stop loss at -50% from entry value
       • Trailing stop: 5% below peak, ONLY activates after +30% gain
       • At +100%: prompts you to sell (hold or exit your choice)
       • Buys new contracts while existing positions are still open
@@ -680,6 +785,7 @@ def options_swing(
     \b
     Example:
       trading-bot options-swing AAPL
+      trading-bot options-swing AAPL --risk 0.05 --max-positions 5
       trading-bot options-swing AAPL --contracts 2 --max-positions 5 --refresh 120
     """
     symbol = symbol.upper()
@@ -691,15 +797,16 @@ def options_swing(
         return
 
     mode_tag = "[yellow]PAPER[/yellow]" if config.is_paper else "[red bold]LIVE[/red bold]"
+    sizing_tag = f"{risk:.0%} of buying power/entry" if risk is not None else f"{contracts} contract(s)/entry"
     console.print(
         f"\n[bold magenta]OPTIONS SWING[/bold magenta]  {mode_tag}  "
         f"[cyan]{symbol}[/cyan]  "
         f"15% OTM CALL  45–79 DTE  "
-        f"{contracts} contract(s)/entry  max {max_positions} open"
+        f"{sizing_tag}  max {max_positions} open"
     )
     console.print(
         f"[dim]Monitor every {interval}s · scan for new entries every {refresh}s · "
-        "trailing stop 5% from peak (activates at +30%) · prompt at +100%[/dim]\n"
+        "hard stop -50% · trailing stop 5% from peak (activates at +30%) · prompt at +100%[/dim]\n"
     )
 
     managed: list[_ManagedOption] = []  # all currently tracked positions
@@ -785,6 +892,26 @@ def options_swing(
                             f"[dim]Holding. Next prompt at {next_thr:.0%}.[/dim]"
                         )
                         pos_obj.next_ask_threshold = next_thr
+
+                # Hard stop loss: exit immediately if down 50% or more from entry
+                if pos_obj.entry_value > 0:
+                    change_from_entry = (mkt_val - pos_obj.entry_value) / pos_obj.entry_value
+                    if change_from_entry <= -0.50:
+                        log_step(
+                            f"[bold red]HARD STOP LOSS {option_symbol}  "
+                            f"{change_from_entry:.1%} from entry  "
+                            f"(${mkt_val:.2f} vs entry ${pos_obj.entry_value:.2f})[/bold red]"
+                        )
+                        try:
+                            close_option_position(config, option_symbol)
+                            console.print(
+                                f"[red]{option_symbol} stopped out.  "
+                                f"P&L: ${pl_dollar:+.2f} ({plpc:+.1%})[/red]"
+                            )
+                        except Exception as e:
+                            console.print(f"[red]Close error: {e}[/red]")
+                        closed_symbols.append(option_symbol)
+                        continue
 
                 # Trailing stop check (only after activated)
                 if pos_obj.trailing_active and pos_obj.peak_value > 0:
@@ -892,11 +1019,31 @@ def options_swing(
                         continue
 
                     actual_otm = opt["otm_pct"] * 100
+
+                    # Dynamic sizing: if --risk set, derive contracts from buying power
+                    buy_contracts = contracts
+                    if risk is not None:
+                        acct = fetch_account(config)
+                        budget = acct["buying_power"] * risk
+                        opt_price = fetch_option_price(config, opt["symbol"])
+                        if opt_price and opt_price > 0:
+                            buy_contracts = max(1, int(budget / (opt_price * 100)))
+                            log_step(
+                                f"Risk {risk:.0%} · buying power ${acct['buying_power']:,.0f} · "
+                                f"budget ${budget:,.0f} · option ${opt_price:.2f}/share · "
+                                f"→ [bold]{buy_contracts} contract(s)[/bold]"
+                            )
+                        else:
+                            log_step(
+                                f"[yellow]Could not fetch option price — "
+                                f"defaulting to {contracts} contract(s).[/yellow]"
+                            )
+
                     console.print(
                         f"\n[bold]Contract:[/bold]  [cyan]{opt['symbol']}[/cyan]  "
                         f"strike ${opt['strike']:.2f} ([yellow]{actual_otm:+.1f}% OTM[/yellow])  "
                         f"exp {opt['expiry']} ({opt['dte']}d DTE)  "
-                        f"{contracts} contract(s)"
+                        f"{buy_contracts} contract(s)"
                     )
 
                     # Confirm unless --auto
@@ -906,24 +1053,27 @@ def options_swing(
                             "[yellow]PAPER[/yellow]" if config.is_paper else "[red]LIVE[/red]"
                         )
                         console.print(f"Mode: {mode_label}")
-                        if not click.confirm(f"Buy {contracts}x {opt['symbol']}?"):
+                        if not click.confirm(f"Buy {buy_contracts}x {opt['symbol']}?"):
                             console.print("[yellow]Skipped.[/yellow]")
                             proceed = False
 
                     if proceed:
-                        log_step(f"Submitting BUY {contracts}x {opt['symbol']}...")
+                        log_step(f"Submitting BUY {buy_contracts}x {opt['symbol']}...")
                         try:
-                            result = execute_option_buy(config, opt["symbol"], contracts)
+                            result = execute_option_buy(config, opt["symbol"], buy_contracts)
                             console.print(
                                 f"[green]Bought![/green]  ID: {result['order_id']}  "
                                 f"({len(managed) + 1}/{max_positions} positions)"
                             )
                             log_step("Waiting 8s for fill...")
                             time.sleep(8)
+                            entry_pos = get_position(config, opt["symbol"])
+                            entry_val = float(entry_pos["market_value"]) if entry_pos else 0.0
                             managed.append(
                                 _ManagedOption(
                                     option_symbol=opt["symbol"],
-                                    contracts=contracts,
+                                    contracts=buy_contracts,
+                                    entry_value=entry_val,
                                 )
                             )
                         except Exception as e:

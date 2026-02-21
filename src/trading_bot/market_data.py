@@ -92,6 +92,31 @@ def fetch_latest_price(config: Config, symbol: str) -> float:
     return float(bar[symbol].close)
 
 
+def fetch_option_price(config: Config, option_symbol: str) -> float | None:
+    """Return the mid-price (bid+ask)/2 for an option contract, or None on failure.
+
+    Uses Alpaca's OptionHistoricalDataClient. Returns None if the option data
+    feed is unavailable (e.g. free-tier account without options data).
+    """
+    try:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionLatestQuoteRequest
+
+        client = OptionHistoricalDataClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key,
+        )
+        request = OptionLatestQuoteRequest(symbol_or_symbols=option_symbol)
+        quotes = client.get_option_latest_quote(request)
+        q = quotes[option_symbol]
+        ask = float(q.ask_price) if q.ask_price else 0.0
+        bid = float(q.bid_price) if q.bid_price else 0.0
+        mid = (ask + bid) / 2
+        return mid if mid > 0 else (ask or None)
+    except Exception:
+        return None
+
+
 def fetch_account(config: Config) -> dict:
     client = get_trading_client(config)
     account = client.get_account()

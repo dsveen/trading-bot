@@ -274,6 +274,101 @@ def show_trade_history(trades: list[dict], days: int) -> None:
     )
 
 
+def show_backtest_summary(summary: dict, symbol: str, days: int, capital: float) -> None:
+    """Print a summary panel for a completed backtest."""
+    if not summary:
+        console.print("[yellow]Not enough data to run backtest.[/yellow]")
+        return
+
+    total_pl = summary["total_pl"]
+    total_return = summary["total_return"]
+    pl_color = "green" if total_pl >= 0 else "red"
+
+    table = Table(title=f"Backtest Results — {symbol}  ({days}d history, ${capital:,.0f} start)")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+
+    table.add_row("Total Trades", str(summary["total_trades"]))
+    table.add_row(
+        "Win Rate",
+        f"[{'green' if summary['win_rate'] >= 0.5 else 'red'}]"
+        f"{summary['win_rate']:.1%}[/]  "
+        f"({summary['wins']}W / {summary['losses']}L)",
+    )
+    table.add_row(
+        "Total P&L",
+        f"[{pl_color}]${total_pl:+,.2f}  ({total_return:+.1%})[/{pl_color}]",
+    )
+    table.add_row("Final Equity", f"${summary['final_equity']:,.2f}")
+    table.add_row("Avg Win", f"[green]${summary['avg_win']:,.2f}[/green]")
+    table.add_row("Avg Loss", f"[red]${summary['avg_loss']:,.2f}[/red]")
+    table.add_row(
+        "Profit Factor",
+        f"[{'green' if summary['profit_factor'] >= 1 else 'red'}]"
+        f"{summary['profit_factor']:.2f}[/]",
+    )
+    table.add_row(
+        "Max Drawdown",
+        f"[{'red' if summary['max_drawdown'] > 0.15 else 'yellow'}]"
+        f"{summary['max_drawdown']:.1%}[/]",
+    )
+    table.add_row("Sharpe (est.)", f"{summary['sharpe']:.2f}")
+
+    console.print(table)
+
+
+def show_backtest_trades(trades: list, verbose: bool = False) -> None:
+    """Print a table of individual backtest trades."""
+    if not trades:
+        console.print("[yellow]No trades executed.[/yellow]")
+        return
+
+    table = Table(title=f"Individual Trades ({len(trades)} total)")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Entry Date")
+    table.add_column("Exit Date")
+    table.add_column("Side", justify="center")
+    table.add_column("Entry $", justify="right")
+    table.add_column("Exit $", justify="right")
+    table.add_column("Shares", justify="right")
+    table.add_column("P&L", justify="right")
+    table.add_column("P&L %", justify="right")
+    table.add_column("Exit Reason")
+
+    for n, t in enumerate(trades, 1):
+        pl_color = "green" if t.pl > 0 else "red"
+        reason_color = {
+            "take_profit": "green",
+            "stop_loss":   "red",
+            "end_of_data": "dim",
+        }.get(t.exit_reason, "white")
+        reason_label = {
+            "take_profit": "Take Profit",
+            "stop_loss":   "Stop Loss",
+            "end_of_data": "EOD close",
+        }.get(t.exit_reason, t.exit_reason)
+
+        table.add_row(
+            str(n),
+            t.entry_date,
+            t.exit_date,
+            f"{'↑' if t.side == 'long' else '↓'} {t.side}",
+            f"${t.entry_price:.2f}",
+            f"${t.exit_price:.2f}",
+            str(t.shares),
+            f"[{pl_color}]${t.pl:+,.2f}[/{pl_color}]",
+            f"[{pl_color}]{t.plpc:+.1%}[/{pl_color}]",
+            f"[{reason_color}]{reason_label}[/{reason_color}]",
+        )
+        if verbose and t.signals:
+            table.add_row(
+                "", "", "", "", "", "", "",
+                f"[dim]{', '.join(t.signals)}[/dim]", "", "",
+            )
+
+    console.print(table)
+
+
 def show_account(account: dict, mode: str) -> None:
     mode_color = "yellow" if mode == "paper" else "red"
     table = Table(title="Account Status")
